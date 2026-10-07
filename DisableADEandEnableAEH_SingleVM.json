@@ -1,0 +1,241 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "vmName": {
+            "type": "String",
+            "metadata": {
+                "description": "Name of the existing virtual machine."
+            }
+        },
+        "timeparameter": {
+            "defaultValue": "[utcNow()]",
+            "type": "String",
+            "metadata": {
+                "description": "Auto-generated salt to make names unique per deployment."
+            }
+        },
+        "resourceGroupName": {
+            "type": "String",
+            "metadata": {
+                "description": "Resource group of the existing virtual machine."
+            }
+        }
+    },
+    "variables": {
+        "uamiName": "[tolower(concat('ui-', uniquestring(resourceGroup().id, parameters('timeparameter'))))]",
+        "roleAssignmentGuid": "[guid(resourceGroup().id, variables('uamiName'))]",
+        "dsStorageName": "[toLower(take(concat('dss', uniqueString(resourceGroup().id, parameters('vmName'),parameters('timeparameter'))), 24))]"
+    },
+    "resources": [
+        {
+            "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+            "apiVersion": "2018-11-30",
+            "name": "[variables('uamiName')]",
+            "location": "[resourceGroup().location]"
+        },
+        {
+            "type": "Microsoft.Storage/storageAccounts",
+            "apiVersion": "2023-01-01",
+            "name": "[variables('dsStorageName')]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName'))]"
+            ],
+            "sku": {
+                "name": "Standard_LRS"
+            },
+            "kind": "StorageV2",
+            "properties": {
+                "publicNetworkAccess": "Enabled",
+                "allowSharedKeyAccess": true,
+                "allowBlobPublicAccess": false,
+                "minimumTlsVersion": "TLS1_2",
+                "supportsHttpsTrafficOnly": true
+            }
+        },
+        {
+            "type": "Microsoft.Authorization/roleAssignments",
+            "apiVersion": "2022-04-01",
+            "name": "[variables('roleAssignmentGuid')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('dsStorageName'))]"
+            ],
+            "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')]",
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName')), '2018-11-30').principalId]",
+                "principalType": "ServicePrincipal"
+            }
+        },
+        {
+            "type": "Microsoft.Resources/deploymentScripts",
+            "apiVersion": "2020-10-01",
+            "name": "[format('disableEncryptiononAllDisk-{0}', parameters('vmName'))]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[variables('roleAssignmentGuid')]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('dsStorageName'))]"
+            ],
+            "kind": "AzurePowerShell",
+            "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                    "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName'))]": {}
+                }
+            },
+            "properties": {
+                "azPowerShellVersion": "8.2",
+                "timeout": "PT2H",
+                "arguments": "[format(' -rgName {0} -vmName {1}', parameters('resourceGroupName'), parameters('vmName'))]",
+                "storageAccountSettings": {
+                    "storageAccountName": "[variables('dsStorageName')]",
+                    "storageAccountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('dsStorageName')), '2023-01-01').keys[0].value]"
+                },
+                "scriptContent": "param([string][Parameter(Mandatory=$true)]$rgName,[string][Parameter(Mandatory=$true)]$vmName)\n$ErrorActionPreference='Stop'\n# Ensure subscription context for UAMI in DeploymentScript container\n$_ctx = Get-AzContext; if (-not $_ctx.Subscription.Id) { $_sub = (Get-AzSubscription -ErrorAction Stop | Select-Object -First 1).Id; Set-AzContext -SubscriptionId $_sub -ErrorAction Stop | Out-Null; Write-Output (\"[INFO] Set subscription context to $_sub\") }\n\nWrite-Output '[STEP 1] Checking initial BitLocker status for ALL volumes...'\n\n# Build guest script that returns JSON with Drive and Pct for all mounted volumes\n$guestScript = @'\nfunction Get-EncryptionStatusJson {\n    $ErrorActionPreference = \"Stop\"\n    if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {\n        $vols = Get-BitLockerVolume |\n            Where-Object { $_.MountPoint } |\n            Select-Object @{n='Drive';e={$_.MountPoint}}, @{n='Pct';e={[double]$_.EncryptionPercentage}}\n        if ($vols) { return ($vols | ConvertTo-Json -Compress) }\n    }\n    $letters = (Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object { $_.DriveLetter + ':' })\n    $list = @()\n    foreach ($letter in $letters) {\n        $out = & manage-bde -status $letter 2>&1\n        $pctLine = ($out | Select-String -Pattern 'Percentage Encrypted:\\s*(\\d+(?:\\.\\d+)?)%')\n        $pct = if ($pctLine -and $pctLine.Matches.Count -gt 0) { [double]$pctLine.Matches[0].Groups[1].Value } else { 0.0 }\n        $list += [pscustomobject]@{ Drive = $letter; Pct = $pct }\n    }\n    if ($list.Count -gt 0) { return ($list | ConvertTo-Json -Compress) } else { return '[]' }\n}\n# Emit JSON to StdOut so RunCommand captures it\nGet-EncryptionStatusJson\n'@\n\n# Initial sample\n$init = Invoke-AzVMRunCommand -ResourceGroupName $rgName -Name $vmName -CommandId 'RunPowerShellScript' -ScriptString $guestScript\n$initStdOut = ($init.Value | Where-Object { $_.Code -like '*StdOut*' }).Message\n$initStdErr = ($init.Value | Where-Object { $_.Code -like '*StdErr*' }).Message\nif ($initStdErr) { Write-Output (\"[INFO] Initial StdErr: \" + $initStdErr) }\ntry { $initVols = $initStdOut | ConvertFrom-Json } catch { $initVols = @() }\nWrite-Output ('[INFO] Initial volumes: ' + ( ($initVols | ForEach-Object { \"{0}:{1}%\" -f $_.Drive, $_.Pct }) -join ', ' ))\n\nWrite-Output '[STEP 2] Disabling Azure Disk Encryption for ALL volumes...'\nDisable-AzVMDiskEncryption -ResourceGroupName $rgName -VMName $vmName -VolumeType All -Force\nWrite-Output '[INFO] Disable-AzVMDiskEncryption invoked.'\n\nWrite-Output '[STEP 3] Waiting until every BitLocker volume shows 0.0% (fully decrypted)...'\n$iteration = 0\n$allZero   = $false\n$maxIters  = 480   # up to ~8 hours (60s intervals)\n\nwhile (-not $allZero) {\n    $iteration++\n    Start-Sleep -Seconds 60\n\n    # Ensure VM is running before polling guest\n    $pwr = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses | Where-Object { $_.Code -like 'PowerState/*' } | Select-Object -First 1\n    if (-not $pwr -or $pwr.Code -ne 'PowerState/running') {\n        Write-Output (\"[CHECK $iteration] VM power state is not running ({0}); waiting...\" -f ($pwr.Code))\n        if ($iteration -ge $maxIters) { throw \"Timeout: VM not running after $maxIters iterations.\" }\n        continue\n    }\n\n    # Poll guest for all drives' encryption %\n    $poll = Invoke-AzVMRunCommand -ResourceGroupName $rgName -Name $vmName -CommandId 'RunPowerShellScript' -ScriptString $guestScript\n    $msgOut = ($poll.Value | Where-Object { $_.Code -like '*StdOut*' }).Message\n    $msgErr = ($poll.Value | Where-Object { $_.Code -like '*StdErr*' }).Message\n    if ($msgErr) { Write-Output (\"[CHECK $iteration] StdErr: \" + $msgErr) }\n\n    try { $vols = $msgOut | ConvertFrom-Json } catch { $vols = @() }\n if (-not $vols -or $vols.Count -eq 0) {\n        Write-Output \"[CHECK] No volumes found this iteration; retrying...\"\n        if ($iteration -ge $maxIters) { throw \"Timeout: No volumes detected after $maxIters iterations.\" }\n        continue\n    }\n\n    $statusLine = ( ($vols | ForEach-Object { \"{0}:{1}%\" -f $_.Drive, $_.Pct }) -join ', ' )\n    Write-Output (\"[CHECK $iteration] \" + $statusLine)\n\n    $allZero = ($vols | Where-Object { [double]$_.Pct -gt 0 }).Count -eq 0\n    if (-not $allZero -and $iteration -ge $maxIters) { throw \"Timeout: Not all volumes reached 0.0% after $maxIters iterations.\" }\n}\n\nWrite-Output '[STEP 4] All volumes report 0.0% encryption. Removing ADE extension...'\nRemove-AzVMExtension -ResourceGroupName $rgName -VMName $vmName -Name 'AzureDiskEncryption' -Force\nWrite-Output '[DONE] ADE extension removed successfully.'",
+                "cleanupPreference": "OnSuccess",
+                "retentionInterval": "P1D"
+            }
+        },
+        {
+            "type": "Microsoft.Resources/deploymentScripts",
+            "apiVersion": "2020-10-01",
+            "name": "[format('CaptureSourceVM-{0}', parameters('vmName'))]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Resources/deploymentScripts', format('disableEncryptiononAllDisk-{0}', parameters('vmName')))]"
+            ],
+            "kind": "AzurePowerShell",
+            "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                    "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName'))]": {}
+                }
+            },
+            "properties": {
+                "azPowerShellVersion": "8.2",
+                "timeout": "PT1H",
+                "arguments": "[format(' -rgName {0} -vmName {1}', parameters('resourceGroupName'), parameters('vmName'))]",
+                "storageAccountSettings": {
+                    "storageAccountName": "[variables('dsStorageName')]",
+                    "storageAccountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('dsStorageName')), '2023-01-01').keys[0].value]"
+                },
+                "scriptContent": "param([string][Parameter(Mandatory=$true)]$rgName,[string][Parameter(Mandatory=$true)]$vmName)\n$ErrorActionPreference='Stop'\n# Ensure subscription context for UAMI in DeploymentScript container\n$_ctx = Get-AzContext; if (-not $_ctx.Subscription.Id) { $_sub = (Get-AzSubscription -ErrorAction Stop | Select-Object -First 1).Id; Set-AzContext -SubscriptionId $_sub -ErrorAction Stop | Out-Null; Write-Output (\"[INFO] Set subscription context to $_sub\") }\n\n# Get VM details\n$vm = Get-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop\n\n# Boot diagnostics capture\n$bootEnabled = $false\n$bootStorageUri = ''\nif ($vm.DiagnosticsProfile -and $vm.DiagnosticsProfile.BootDiagnostics) {\n    $bootEnabled = [bool]$vm.DiagnosticsProfile.BootDiagnostics.Enabled\n    if ($vm.DiagnosticsProfile.BootDiagnostics.StorageUri) {\n        $bootStorageUri = [string]$vm.DiagnosticsProfile.BootDiagnostics.StorageUri\n    }\n}\n\n# Zones, Availability Set, Tags, Identity\n$zone = ''\nif ($vm.Zones -and $vm.Zones.Count -gt 0) { $zone = [string]$vm.Zones[0] }\n$avSetId = ''\nif ($vm.AvailabilitySet) { $avSetId = [string]$vm.AvailabilitySet.Id }\n$tagsJson = ''\nif ($vm.Tags) { $tagsJson = ($vm.Tags | ConvertTo-Json -Compress) }\n$identityJson = ''\nif ($vm.Identity) {\n    $identityObj = [ordered]@{ type = $vm.Identity.Type; userAssigned = @() }\n    if ($vm.Identity.UserAssignedIdentities) { $identityObj.userAssigned = $vm.Identity.UserAssignedIdentities.Keys }\n    $identityJson = ($identityObj | ConvertTo-Json -Compress)\n}\n\n# Capture installed extensions\n$extsJson = ''\ntry {\n    $exts = Get-AzVMExtension -ResourceGroupName $rgName -VMName $vmName -ErrorAction SilentlyContinue\n    if ($exts) {\n        $payload = $exts | Select-Object Name,Publisher,ExtensionType,TypeHandlerVersion,AutoUpgradeMinorVersion,Settings\n        $extsJson = ($payload | ConvertTo-Json -Compress -Depth 10)\n    }\n} catch {}\n\n# Encode extensions JSON as Base64\n$extsB64 = ''\nif ($extsJson -and $extsJson.Trim().Length -gt 0) {\n    try {\n        $extsB64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($extsJson))\n    } catch {\n        $extsB64 = ''\n    }\n}\n\n# Capture SecurityType\n$securityType = ''\nif ($vm.SecurityProfile -and $vm.SecurityProfile.SecurityType) {\n    $securityType = [string]$vm.SecurityProfile.SecurityType\n}\n\n# Outputs\n$DeploymentScriptOutputs = @{}\n$DeploymentScriptOutputs['bootEnabled']       = $bootEnabled.ToString()\n$DeploymentScriptOutputs['bootStorageUri']    = [string]$bootStorageUri\n$DeploymentScriptOutputs['zone']              = [string]$zone\n$DeploymentScriptOutputs['availabilitySetId'] = [string]$avSetId\n$DeploymentScriptOutputs['vmSize']            = [string]$vm.HardwareProfile.VmSize\n$DeploymentScriptOutputs['tagsJson']          = [string]$tagsJson\n$DeploymentScriptOutputs['identityJson']      = [string]$identityJson\n$DeploymentScriptOutputs['extensionsJsonB64'] = [string]$extsB64\n$DeploymentScriptOutputs['securityType']      = [string]$securityType",
+                "cleanupPreference": "OnSuccess",
+                "retentionInterval": "PT24H"
+            }
+        },
+        {
+            "type": "Microsoft.Resources/deploymentScripts",
+            "apiVersion": "2020-10-01",
+            "name": "[format('StopSourceVM-{0}', parameters('vmName'))]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Resources/deploymentScripts', format('CaptureSourceVM-{0}', parameters('vmName')))]"
+            ],
+            "kind": "AzurePowerShell",
+            "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                    "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName'))]": {}
+                }
+            },
+            "properties": {
+                "azPowerShellVersion": "8.2",
+                "timeout": "PT1H",
+                "arguments": "[format(' -rgName {0} -vmName {1}', parameters('resourceGroupName'), parameters('vmName'))]",
+                "storageAccountSettings": {
+                    "storageAccountName": "[variables('dsStorageName')]",
+                    "storageAccountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('dsStorageName')), '2023-01-01').keys[0].value]"
+                },
+                "scriptContent": "param([string]$rgName,[string]$vmName)\n$ErrorActionPreference='Stop'\n# Ensure subscription context for UAMI in DeploymentScript container\n$_ctx = Get-AzContext; if (-not $_ctx.Subscription.Id) { $_sub = (Get-AzSubscription -ErrorAction Stop | Select-Object -First 1).Id; Set-AzContext -SubscriptionId $_sub -ErrorAction Stop | Out-Null; Write-Output (\"[INFO] Set subscription context to $_sub\") }\nWrite-Output '[STEP 0] Stopping VM...'\nStop-AzVM -ResourceGroupName $rgName -Name $vmName -Force\nWrite-Output '[INFO] Waiting for VM to reach StoppedDeallocated state...'\ndo {\n    Start-Sleep -Seconds 30\n    $vmStatus = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus\n    Write-Output \"[STATUS] VM: $vmStatus\"\n} while ($vmStatus -notcontains 'VM deallocated')\nWrite-Output '[DONE] VM is stopped and deallocated.'",
+                "cleanupPreference": "OnSuccess",
+                "retentionInterval": "P1D"
+            }
+        },
+        {
+            "type": "Microsoft.Resources/deploymentScripts",
+            "apiVersion": "2020-10-01",
+            "name": "[format('copydatatonewdisk-{0}', parameters('vmName'))]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Resources/deploymentScripts', format('StopSourceVM-{0}', parameters('vmName')))]"
+            ],
+            "kind": "AzurePowerShell",
+            "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                    "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName'))]": {}
+                }
+            },
+            "properties": {
+                "azPowerShellVersion": "8.2",
+                "timeout": "PT2H",
+                "arguments": "[format(' -rgName \"{0}\" -vmName \"{1}\" -timeStamp \"{2}\"', parameters('resourceGroupName'), parameters('vmName'), parameters('timeparameter'))]",
+                "storageAccountSettings": {
+                    "storageAccountName": "[variables('dsStorageName')]",
+                    "storageAccountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('dsStorageName')), '2023-01-01').keys[0].value]"
+                },
+                "scriptContent": "param([string][Parameter(Mandatory=$true)]$rgName,[string][Parameter(Mandatory=$true)]$vmName,[string][Parameter(Mandatory=$true)]$timeStamp)\n$ErrorActionPreference='Stop'\n# Ensure subscription context for UAMI in DeploymentScript container\n$_ctx = Get-AzContext; if (-not $_ctx.Subscription.Id) { $_sub = (Get-AzSubscription -ErrorAction Stop | Select-Object -First 1).Id; Set-AzContext -SubscriptionId $_sub -ErrorAction Stop | Out-Null; Write-Output (\"[INFO] Set subscription context to $_sub\") }\n$ProgressPreference='SilentlyContinue'\n$WarningPreference='SilentlyContinue'\n\nWrite-Output '[STEP 1] Loading source VM and inventorying disks...'\n$vm = Get-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop\n$targetRG = $rgName\n$targetLocate = $vm.Location\nWrite-Output (\"[INFO] VM Location: {0}\" -f $targetLocate)\n\n# Determine source SecurityType\n$sourceSecurityType = ''\nif ($vm.SecurityProfile -and $vm.SecurityProfile.SecurityType) { $sourceSecurityType = [string]$vm.SecurityProfile.SecurityType }\n$hasSecurityType = ($sourceSecurityType -and $sourceSecurityType.Trim().Length -gt 0)\nWrite-Output (\"[INFO] Source VM SecurityType: {0}\" -f ( $hasSecurityType ? $sourceSecurityType : 'none/standard' ))\n\n# OS Disk copy\n$sourceOSDiskName = $vm.StorageProfile.OsDisk.Name\nWrite-Output (\"[INFO] Source OS Disk: {0}\" -f $sourceOSDiskName)\n$sourceOSDisk = Get-AzDisk -ResourceGroupName $rgName -DiskName $sourceOSDiskName -ErrorAction Stop\n$targetOSDiskName = \"$sourceOSDiskName-$timeStamp\"\nWrite-Output (\"[INFO] Target OS Disk Name: {0}\" -f $targetOSDiskName)\n\n$targetOS = 'Windows'\n$targetVmGeneration = $sourceOSDisk.HyperVGeneration\nif ((-not $targetVmGeneration) -or ($targetVmGeneration.Trim().Length -eq 0)) { $targetVmGeneration = $vm.HyperVGeneration }\nWrite-Output (\"[INFO] Hyper-V Generation: {0}\" -f $targetVmGeneration)\n\n$uploadOSSize = $sourceOSDisk.DiskSizeBytes + 512\n$osSkuName = $sourceOSDisk.Sku.Name\nif (-not $osSkuName -or ($osSkuName.Trim().Length -eq 0)) { $osSkuName = 'Standard_LRS' }\nWrite-Output (\"[INFO] Source OS Disk SKU: {0}\" -f $osSkuName)\n\n$osDiskZone = $sourceOSDisk.Zones\nif (-not $osDiskZone -and $vm.Zones) { $osDiskZone = $vm.Zones }\nif ($osDiskZone -and ($osDiskZone -is [string])) { $osDiskZone = @($osDiskZone) }\n\nif ($osDiskZone -and ($osDiskZone.Count -gt 0)) {\n  $targetOSDiskConfig = New-AzDiskConfig -SkuName $osSkuName -OsType $targetOS -UploadSizeInBytes $uploadOSSize -Location $targetLocate -CreateOption 'Upload' -HyperVGeneration $targetVmGeneration -Zone $osDiskZone\n} else {\n  $targetOSDiskConfig = New-AzDiskConfig -SkuName $osSkuName -OsType $targetOS -UploadSizeInBytes $uploadOSSize -Location $targetLocate -CreateOption 'Upload' -HyperVGeneration $targetVmGeneration\n}\n\n# Apply Disk Security Profile ONLY if SecurityType is present\nif ($hasSecurityType) {\n  $targetOSDiskConfig = Set-AzDiskSecurityProfile -Disk $targetOSDiskConfig -SecurityType $sourceSecurityType\n} else {\n  Write-Output '[INFO] Source VM is Standard (no SecurityType). Skipping Set-AzDiskSecurityProfile for OS disk.'\n}\n\n$null = New-AzDisk -ResourceGroupName $targetRG -DiskName $targetOSDiskName -Disk $targetOSDiskConfig\n\n# SAS and AzCopy\n$sourceOSDiskSas = Grant-AzDiskAccess -ResourceGroupName $rgName -DiskName $sourceOSDiskName -DurationInSecond 86400 -Access 'Read'\n$targetOSDiskSas = Grant-AzDiskAccess -ResourceGroupName $targetRG -DiskName $targetOSDiskName -DurationInSecond 86400 -Access 'Write'\n\nWrite-Output '[INFO] Downloading AzCopy for Linux (once)...'\n$azCopyUrl = 'https://aka.ms/downloadazcopy-v10-linux'\n$azCopyTar = 'azcopy.tar.gz'\nif (-not (Test-Path $azCopyTar)) { Invoke-WebRequest -Uri $azCopyUrl -OutFile $azCopyTar -ErrorAction Stop }\ntry { if (-not (Get-ChildItem -Recurse | Where-Object { $_.Name -eq 'azcopy' })) { tar -xzf $azCopyTar } } catch { Write-Warning (\"[WARN] tar extraction failed: {0}\" -f $_.Exception.Message) }\n$azCopyExe = (Get-ChildItem -Recurse | Where-Object { $_.Name -eq 'azcopy' } | Select-Object -First 1)\nif (-not $azCopyExe) { throw '[ERROR] AzCopy executable not found after extraction.' }\nWrite-Output (\"[INFO] AzCopy path: {0}\" -f $azCopyExe.FullName)\n\n& $azCopyExe.FullName copy $sourceOSDiskSas.AccessSAS $targetOSDiskSas.AccessSAS --blob-type PageBlob\nRevoke-AzDiskAccess -ResourceGroupName $rgName -DiskName $sourceOSDiskName\nRevoke-AzDiskAccess -ResourceGroupName $targetRG -DiskName $targetOSDiskName\n\n$createdOSDisk = Get-AzDisk -ResourceGroupName $targetRG -DiskName $targetOSDiskName -ErrorAction Stop\nWrite-Output (\"[INFO] Target OS disk security type: {0}\" -f ( $createdOSDisk.SecurityType ? $createdOSDisk.SecurityType : 'none' ))\nWrite-Output '[STEP 1 DONE] OS disk copied successfully.'\n\n# Data disks\nWrite-Output '[STEP 2] Copying all data disks (if any)...'\n$dataDisks = $vm.StorageProfile.DataDisks\n$copiedList = @()\nif ($dataDisks -and $dataDisks.Count -gt 0) {\n  foreach ($d in $dataDisks) {\n    $srcDataName = $d.Name\n    $srcDataLun  = $d.Lun\n    $srcCaching  = [string]$d.Caching\n    $srcDataDisk = Get-AzDisk -ResourceGroupName $rgName -DiskName $srcDataName -ErrorAction Stop\n    $tgtDataName = \"$srcDataName-$timeStamp\"\n\n    $dataSkuName = $srcDataDisk.Sku.Name\n    if (-not $dataSkuName -or ($dataSkuName.Trim().Length -eq 0)) { $dataSkuName = 'Standard_LRS' }\n\n    $dataZone = $srcDataDisk.Zones\n    if (-not $dataZone -and $vm.Zones) { $dataZone = $vm.Zones }\n    if ($dataZone -and ($dataZone -is [string])) { $dataZone = @($dataZone) }\n\n    $uploadDataSize = $srcDataDisk.DiskSizeBytes + 512\n\n    if ($dataZone -and ($dataZone.Count -gt 0)) {\n      $tgtDataConfig = New-AzDiskConfig -SkuName $dataSkuName -UploadSizeInBytes $uploadDataSize -Location $targetLocate -CreateOption 'Upload' -Zone $dataZone\n    } else {\n      $tgtDataConfig = New-AzDiskConfig -SkuName $dataSkuName -UploadSizeInBytes $uploadDataSize -Location $targetLocate -CreateOption 'Upload'\n    }\n\n    # Apply Disk Security Profile ONLY if SecurityType is present\n    if ($hasSecurityType) {\n      $tgtDataConfig = Set-AzDiskSecurityProfile -Disk $tgtDataConfig -SecurityType $sourceSecurityType\n    } else {\n      Write-Output (\"[INFO] Source VM is Standard (no SecurityType). Skipping Set-AzDiskSecurityProfile for data disk: {0}\" -f $srcDataName)\n    }\n\n    $null = New-AzDisk -ResourceGroupName $targetRG -DiskName $tgtDataName -Disk $tgtDataConfig\n\n    $srcDataSas = Grant-AzDiskAccess -ResourceGroupName $rgName -DiskName $srcDataName -DurationInSecond 86400 -Access 'Read'\n    $tgtDataSas = Grant-AzDiskAccess -ResourceGroupName $targetRG -DiskName $tgtDataName -DurationInSecond 86400 -Access 'Write'\n\n    & $azCopyExe.FullName copy $srcDataSas.AccessSAS $tgtDataSas.AccessSAS --blob-type PageBlob\n\n    Revoke-AzDiskAccess -ResourceGroupName $rgName -DiskName $srcDataName\n    Revoke-AzDiskAccess -ResourceGroupName $targetRG -DiskName $tgtDataName\n\n    $createdData = Get-AzDisk -ResourceGroupName $targetRG -DiskName $tgtDataName -ErrorAction Stop\n    Write-Output (\"[INFO] Target data disk security type: {0}\" -f ( $createdData.SecurityType ? $createdData.SecurityType : 'none' ))\n\n    $copiedList += [PSCustomObject]@{ Source=$srcDataName; Target=$tgtDataName; Lun=$srcDataLun; Caching=$srcCaching }\n  }\n} else {\n  Write-Output '[INFO] No data disks attached to the source VM.'\n}\n\n$DeploymentScriptOutputs = @{}\n$DeploymentScriptOutputs['dataDisksCopiedJson'] = ($copiedList | ConvertTo-Json -Compress)\n$DeploymentScriptOutputs['targetOSDiskName']    = [string]$targetOSDiskName\nWrite-Output '[STEP 2 DONE] All data disks processed.'",
+                "cleanupPreference": "OnSuccess",
+                "retentionInterval": "P1D"
+            }
+        },
+        {
+            "type": "Microsoft.Resources/deploymentScripts",
+            "apiVersion": "2020-10-01",
+            "name": "[format('RecreateVMFromCopiedDisk-{0}', parameters('vmName'))]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Resources/deploymentScripts', format('copydatatonewdisk-{0}', parameters('vmName')))]"
+            ],
+            "kind": "AzurePowerShell",
+            "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                    "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName'))]": {}
+                }
+            },
+            "properties": {
+                "azPowerShellVersion": "8.2",
+                "timeout": "PT2H",
+                "arguments": "[format(' -rgName \"{0}\" -vmName \"{1}\" -timeStamp \"{2}\" -extensionsJsonB64 \"{3}\" -bootEnabled \"{4}\" -bootStorageUri \"{5}\" -securityType \"{6}\"', parameters('resourceGroupName'), parameters('vmName'), parameters('timeparameter'), if(equals(reference(resourceId('Microsoft.Resources/deploymentScripts', format('CaptureSourceVM-{0}', parameters('vmName'))), '2020-10-01').outputs.extensionsJsonB64, ''), '_NULL_', reference(resourceId('Microsoft.Resources/deploymentScripts', format('CaptureSourceVM-{0}', parameters('vmName'))), '2020-10-01').outputs.extensionsJsonB64), if(equals(reference(resourceId('Microsoft.Resources/deploymentScripts', format('CaptureSourceVM-{0}', parameters('vmName'))), '2020-10-01').outputs.bootEnabled, ''), 'False', reference(resourceId('Microsoft.Resources/deploymentScripts', format('CaptureSourceVM-{0}', parameters('vmName'))), '2020-10-01').outputs.bootEnabled), if(equals(reference(resourceId('Microsoft.Resources/deploymentScripts', format('CaptureSourceVM-{0}', parameters('vmName'))), '2020-10-01').outputs.bootStorageUri, ''), '_NULL_', reference(resourceId('Microsoft.Resources/deploymentScripts', format('CaptureSourceVM-{0}', parameters('vmName'))), '2020-10-01').outputs.bootStorageUri), if(or(equals(reference(resourceId('Microsoft.Resources/deploymentScripts', format('CaptureSourceVM-{0}', parameters('vmName'))), '2020-10-01').outputs.securityType, ''), equals(reference(resourceId('Microsoft.Resources/deploymentScripts', format('CaptureSourceVM-{0}', parameters('vmName'))), '2020-10-01').outputs.securityType, '_NULL_')), '_NULL_', reference(resourceId('Microsoft.Resources/deploymentScripts', format('CaptureSourceVM-{0}', parameters('vmName'))), '2020-10-01').outputs.securityType))]",
+                "storageAccountSettings": {
+                    "storageAccountName": "[variables('dsStorageName')]",
+                    "storageAccountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('dsStorageName')), '2023-01-01').keys[0].value]"
+                },
+                "scriptContent": "param([string][Parameter(Mandatory=$true)]$rgName,[string][Parameter(Mandatory=$true)]$vmName,[string][Parameter(Mandatory=$true)]$timeStamp,[string]$extensionsJsonB64,[string]$bootEnabled,[string]$bootStorageUri,[string]$securityType)\n$ErrorActionPreference='Stop'\n# Ensure subscription context for UAMI in DeploymentScript container\n$_ctx = Get-AzContext; if (-not $_ctx.Subscription.Id) { $_sub = (Get-AzSubscription -ErrorAction Stop | Select-Object -First 1).Id; Set-AzContext -SubscriptionId $_sub -ErrorAction Stop | Out-Null; Write-Output (\"[INFO] Set subscription context to $_sub\") }\n$ProgressPreference='SilentlyContinue'\n$WarningPreference='SilentlyContinue'\n\n# Normalize placeholders\nif ($extensionsJsonB64 -eq '_NULL_') { $extensionsJsonB64 = '' }\nif ($bootStorageUri    -eq '_NULL_') { $bootStorageUri    = '' }\nif ($securityType      -eq '_NULL_') { $securityType      = '' }\n$bootEnabledTrue = ($bootEnabled -match '^(?i:true)$')\n\n# Ensure Az.Compute cmdlets available\nImport-Module Az.Compute -ErrorAction SilentlyContinue\n\nWrite-Output '[STEP 3] Recreating VM from copied disks...'\n\n# Decode extensions JSON from Base64\n$extensionsJson = ''\nif ($extensionsJsonB64 -and $extensionsJsonB64.Trim().Length -gt 0) {\n    try { $extensionsJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($extensionsJsonB64)) } catch { Write-Warning (\"[EXT] Failed to decode Base64: {0}\" -f $_.Exception.Message) }\n}\n\n# Load source VM\n$srcVm = Get-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop\n\n# Compute target OS disk name\n$sourceDiskName = $srcVm.StorageProfile.OsDisk.Name\n$osDiskName = \"$sourceDiskName-$timeStamp\"\nWrite-Output (\"[INFO] Target OS Disk to attach: {0}\" -f $osDiskName)\n$osDisk = Get-AzDisk -ResourceGroupName $rgName -DiskName $osDiskName -ErrorAction Stop\nif ($osDisk.DiskState -eq 'Attached') { throw \"Disk '$osDiskName' is attached\" }\n\n# NIC discovery\n$nicIds = @()\nif ($srcVm.NetworkProfile -and $srcVm.NetworkProfile.NetworkInterfaces) { $nicIds = $srcVm.NetworkProfile.NetworkInterfaces | ForEach-Object { $_.Id } }\nif ((-not $nicIds) -or ($nicIds.Count -eq 0)) { $nicIds = (Get-AzNetworkInterface -ResourceGroupName $rgName | Where-Object { $_.VirtualMachine -and $_.VirtualMachine.Id -eq $srcVm.Id }) | ForEach-Object { $_.Id } }\nif ((-not $nicIds) -or ($nicIds.Count -eq 0)) { throw \"No NICs discovered for VM '$vmName'\" }\n$nicName = ((( $nicIds | Select-Object -First 1 )) -split '/')[-1]\n$nic = Get-AzNetworkInterface -ResourceGroupName $rgName -Name $nicName -ErrorAction Stop\n\n# Stop & delete source VM\nStop-AzVM -ResourceGroupName $rgName -Name $vmName -Force -ErrorAction SilentlyContinue | Out-Null\nRemove-AzVM -ResourceGroupName $rgName -Name $vmName -Force | Out-Null\nif ($nic.VirtualMachine) { $nic.VirtualMachine = $null; Set-AzNetworkInterface -NetworkInterface $nic | Out-Null }\n\n# Build base VM config (source size)\n$vmCfg = New-AzVMConfig -VMName $vmName -VMSize $srcVm.HardwareProfile.VmSize\n\n# Preserve OS disk caching and attach OS disk\n$osCaching = $srcVm.StorageProfile.OsDisk.Caching\nWrite-Output (\"[INFO] Original OS disk caching: {0}\" -f $osCaching)\n$vmCfg = Set-AzVMOSDisk -VM $vmCfg -ManagedDiskId $osDisk.Id -CreateOption Attach -Windows -Caching $osCaching\n\n# Attach NIC\n$vmCfg = Add-AzVMNetworkInterface -VM $vmCfg -Id $nic.Id\n\n# Apply SecurityType & UEFI; guard Gen2 for TL/CVM\nif ($securityType -and $securityType.Trim().Length -gt 0) {\n    if (-not $vmCfg.SecurityProfile) { $vmCfg.SecurityProfile = New-Object Microsoft.Azure.Management.Compute.Models.SecurityProfile }\n    $vmCfg.SecurityProfile.SecurityType = $securityType\n    if ($vmCfg.SecurityProfile.SecurityType -in @('TrustedLaunch','ConfidentialVM')) {\n        if (-not $vmCfg.SecurityProfile.UefiSettings) { $vmCfg.SecurityProfile.UefiSettings = New-Object Microsoft.Azure.Management.Compute.Models.UefiSettings }\n        $vmCfg.SecurityProfile.UefiSettings.VTpmEnabled = $true\n        $vmCfg.SecurityProfile.UefiSettings.SecureBootEnabled = $true\n        $diskGen = $osDisk.HyperVGeneration\n        if ($diskGen -ne 'V2') { throw \"SecurityType '$($vmCfg.SecurityProfile.SecurityType)' requires Gen2 (V2) OS disk. Current disk HyperVGeneration: '$diskGen'.\" }\n    }\n}\n\n# Preserve Availability Set (if any)\nif ($srcVm.AvailabilitySet) {\n  $vmCfg.AvailabilitySet = New-Object Microsoft.Azure.Management.Compute.Models.SubResource\n  $vmCfg.AvailabilitySet.Id = $srcVm.AvailabilitySet.Id\n}\n\n# --- Reapply Boot Diagnostics (Az 8.x compatible) ---\nif ($bootEnabledTrue) {\n    if (-not $vmCfg.DiagnosticsProfile) {\n        $vmCfg.DiagnosticsProfile = New-Object Microsoft.Azure.Management.Compute.Models.DiagnosticsProfile\n    }\n    if (-not $vmCfg.DiagnosticsProfile.BootDiagnostics) {\n        $vmCfg.DiagnosticsProfile.BootDiagnostics = New-Object Microsoft.Azure.Management.Compute.Models.BootDiagnostics\n    }\n    $vmCfg.DiagnosticsProfile.BootDiagnostics.Enabled = $true\n    if ($bootStorageUri -and $bootStorageUri.Trim().Length -gt 0) {\n        $vmCfg.DiagnosticsProfile.BootDiagnostics.StorageUri = $bootStorageUri\n        Write-Output (\"[INFO] Boot Diagnostics enabled with Storage URI: {0}\" -f $bootStorageUri)\n    } else {\n        Write-Output \"[INFO] Boot Diagnostics enabled without custom Storage URI\"\n    }\n} else {\n    Write-Output \"[INFO] Boot Diagnostics was disabled on source VM; skipping.\"\n}\n\n# Re-attach all data disks with original LUN & caching\n$dataDisks = $srcVm.StorageProfile.DataDisks\n$attachCount = 0\nif ($dataDisks -and $dataDisks.Count -gt 0) {\n  foreach ($d in $dataDisks) {\n    $srcDataName = $d.Name\n    $tgtDataName = \"$srcDataName-$timeStamp\"\n    $tgtData = Get-AzDisk -ResourceGroupName $rgName -DiskName $tgtDataName -ErrorAction Stop\n    $lun = $d.Lun\n    $caching = $d.Caching\n    Write-Output (\"[ATTACH] Data Disk: Name={0} -> {1}, LUN={2}, Caching={3}\" -f $srcDataName, $tgtDataName, $lun, $caching)\n    $vmCfg = Add-AzVMDataDisk -VM $vmCfg -Name $tgtDataName -ManagedDiskId $tgtData.Id -Lun $lun -Caching $caching -CreateOption Attach\n    $attachCount++\n  }\n} else {\n  Write-Output '[INFO] No data disks to attach.'\n}\n\n# Prepare create params (preserve zones & tags)\n$createParams = @{ ResourceGroupName = $rgName; Location = $srcVm.Location; VM = $vmCfg }\nif ($srcVm.Zones -and $srcVm.Zones.Count -gt 0) { $createParams['Zone'] = $srcVm.Zones }\nif ($srcVm.Tags) { $createParams['Tag'] = $srcVm.Tags }\n\n# Create VM\nNew-AzVM @createParams | Out-Null\n\n# Apply extensions after VM creation\ntry {\n    if ($extensionsJson -and $extensionsJson.Trim().Length -gt 0 -and $extensionsJson -ne '[]') {\n        $extList = $extensionsJson | ConvertFrom-Json\n        $skipNames = @('AzureDiskEncryption')\n        foreach ($ext in $extList) {\n            if ($skipNames -contains $ext.Name) { Write-Output (\"[EXT] Skipping '{0}'\" -f $ext.Name); continue }\n            Write-Output (\"[EXT] Applying {0} ({1}/{2} v{3})\" -f $ext.Name, $ext.Publisher, $ext.ExtensionType, $ext.TypeHandlerVersion)\n            $settingsJson = $null\n            if ($ext.Settings) { $settingsJson = ($ext.Settings | ConvertTo-Json -Compress -Depth 10) }\n            if ($settingsJson) {\n                Set-AzVMExtension -ResourceGroupName $rgName -VMName $vmName -Name $ext.Name -Publisher $ext.Publisher -ExtensionType $ext.ExtensionType -TypeHandlerVersion $ext.TypeHandlerVersion -SettingString $settingsJson -ErrorAction Stop\n            } else {\n                Set-AzVMExtension -ResourceGroupName $rgName -VMName $vmName -Name $ext.Name -Publisher $ext.Publisher -ExtensionType $ext.ExtensionType -TypeHandlerVersion $ext.TypeHandlerVersion -ErrorAction Stop\n            }\n            Write-Output (\"[EXT] Applied {0}\" -f $ext.Name)\n        }\n    } else { Write-Output \"[EXT] No extensionsJson provided or empty; skipping reapply.\" }\n} catch { Write-Warning (\"[EXT] Failed to set extensions: {0}\" -f $_.Exception.Message) }\n\n# Outputs\n$DeploymentScriptOutputs = @{}\n$DeploymentScriptOutputs['recreatedVmName'] = $vmName\n$DeploymentScriptOutputs['attachedDataDiskCount'] = [int]$attachCount\nWrite-Output ('[DONE] VM recreated with OS + {0} data disk(s) attached.' -f $attachCount)\n",
+                "cleanupPreference": "OnSuccess",
+                "retentionInterval": "P1D"
+            }
+        },
+        {
+            "type": "Microsoft.Resources/deploymentScripts",
+            "apiVersion": "2020-10-01",
+            "name": "[format('EnableEncryptionAtHost-{0}', parameters('vmName'))]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Resources/deploymentScripts', format('RecreateVMFromCopiedDisk-{0}', parameters('vmName')))]"
+            ],
+            "kind": "AzurePowerShell",
+            "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                    "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName'))]": {}
+                }
+            },
+            "properties": {
+                "azPowerShellVersion": "8.2",
+                "timeout": "PT2H",
+                "arguments": "[format(' -rgName {0} -vmName {1}', parameters('resourceGroupName'), parameters('vmName'))]",
+                "storageAccountSettings": {
+                    "storageAccountName": "[variables('dsStorageName')]",
+                    "storageAccountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('dsStorageName')), '2023-01-01').keys[0].value]"
+                },
+                "scriptContent": "param([string][Parameter(Mandatory=$true)]$rgName,[string][Parameter(Mandatory=$true)]$vmName)\n$ErrorActionPreference='Stop'\n# Ensure subscription context for UAMI in DeploymentScript container\n$_ctx = Get-AzContext; if (-not $_ctx.Subscription.Id) { $_sub = (Get-AzSubscription -ErrorAction Stop | Select-Object -First 1).Id; Set-AzContext -SubscriptionId $_sub -ErrorAction Stop | Out-Null; Write-Output (\"[INFO] Set subscription context to $_sub\") }\n$ProgressPreference='SilentlyContinue'\n$WarningPreference='SilentlyContinue'\ntry{$PSStyle.OutputRendering='PlainText'}catch{}\n$vmStatus=Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status -ErrorAction Stop\n$prov=$vmStatus.Statuses|Where-Object{$_.Code -like 'ProvisioningState/*'}|Select-Object -First 1\n$provCode=if($prov){$prov.Code}else{''}\nif(-not $prov -or $prov.Code -ne 'ProvisioningState/succeeded'){throw (\"VM '$vmName' provisioning state is not succeeded (actual: $provCode)\")}\nStop-AzVM -ResourceGroupName $rgName -Name $vmName -Force|Out-Null\nfor($i=0;$i -lt 40;$i++){Start-Sleep -Seconds 6;$st=(Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses|Where-Object{$_.Code -like 'PowerState/*'}|Select-Object -First 1;if($st.Code -eq 'PowerState/deallocated'){break}}\nif($st.Code -ne 'PowerState/deallocated'){throw (\"VM '$vmName' did not reach PowerState/deallocated\")}\n$vmObj=Get-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop\nif(-not $vmObj.SecurityProfile){$vmObj.SecurityProfile=New-Object Microsoft.Azure.Management.Compute.Models.SecurityProfile}\n$vmObj.SecurityProfile.EncryptionAtHost=$true\nUpdate-AzVM -ResourceGroupName $rgName -VM $vmObj|Out-Null\nStart-AzVM -ResourceGroupName $rgName -Name $vmName|Out-Null\n$final=Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status\n$eah=(Get-AzVM -ResourceGroupName $rgName -Name $vmName).SecurityProfile.EncryptionAtHost\n$power=$final.Statuses|Where-Object{$_.Code -like 'PowerState/*'}|Select-Object -First 1\n$DeploymentScriptOutputs=@{}\n$DeploymentScriptOutputs['encryptionAtHostEnabled']=[bool]$eah\n$DeploymentScriptOutputs['finalPowerState']=[string]$power.Code",
+                "cleanupPreference": "OnSuccess",
+                "retentionInterval": "P1D"
+            }
+        }
+    ]
+}

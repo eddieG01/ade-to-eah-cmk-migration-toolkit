@@ -1,0 +1,20 @@
+# Local artifacts
+*.log
+*.tmp
+azcopy*
+*.tar.gz
+
+# Local parameter files / secrets — NEVER commit
+*.parameters.local.json
+*.secrets.json
+.env
+*.pem
+*.pfx
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
